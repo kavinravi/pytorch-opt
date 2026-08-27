@@ -1,7 +1,7 @@
 # pytorch-opt — Design Spec
 
 - **Date:** 2026-08-25
-- **Status:** Approved (conversation with Kavin, 2026-08-25). Implementation authorized to proceed autonomously.
+- **Status:** Implemented 2026-08-26 (v1 spine + full extension roster; 227 tests green). See docs/2026-08-26-build-report.md.
 - **Owner:** Kavin Ravi
 
 ---
