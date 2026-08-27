@@ -10,11 +10,18 @@ class StepTimer:
 
     def __enter__(self):
         self.t0 = time.perf_counter()
+        self._final = None
         return self
 
     def __exit__(self, *exc):
-        self.ms = (time.perf_counter() - self.t0) * 1e3
+        self._final = (time.perf_counter() - self.t0) * 1e3
         return False
+
+    @property
+    def ms(self) -> float:
+        if self._final is not None:
+            return self._final
+        return (time.perf_counter() - self.t0) * 1e3
 
 
 class DiagnosticsMixin:
