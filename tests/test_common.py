@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from pytorch_opt._testing import TinyMLP, make_regression, mse_half, run_steps
-from pytorch_opt.optim import AdaHessian, EKFAC, HessianFree, KFAC, Muon, NGD, Shampoo, SOAP, Sophia, TrustNCG
+from pytorch_opt.optim import AdaHessian, EKFAC, HessianFree, KFAC, Muon, NGD, PSGD, Shampoo, SOAP, Sophia, TrustNCG
 
 FACTORIES = {
     "muon": lambda m: Muon(m.parameters(), lr=0.02),
@@ -23,6 +23,7 @@ FACTORIES = {
     "sophia": lambda m: Sophia(m.parameters(), lr=2e-2, estimate_freq=3),
     "ekfac": lambda m: EKFAC(m, lr=0.02, damping=1e-2, inv_every=2),
     "hessianfree": lambda m: HessianFree(m.parameters(), max_cg_iter=15),
+    "psgd": lambda m: PSGD(m.parameters(), lr=0.02),
 }
 
 REQUIRED_DIAG = {
@@ -41,6 +42,7 @@ REQUIRED_DIAG = {
               "nat_grad_norm", "step_ms", "curvature_ms"},
     "hessianfree": {"damping", "rho", "cg_iters", "backtracked_to",
                     "accepted", "step_ms"},
+    "psgd": {"n_diag_params", "q_updates", "step_ms", "curvature_ms"},
 }
 
 
