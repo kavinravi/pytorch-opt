@@ -87,6 +87,14 @@ class KFAC(Optimizer, DiagnosticsMixin):
         cond = float((ev.max() + gamma) / max(float(ev.min()) + gamma, 1e-300))
         return inv, cond
 
+    def _precondition(self, name: str, V: torch.Tensor) -> torch.Tensor:
+        """Apply the (approximate) inverse Fisher to a module gradient matrix.
+        Subclasses (EKFAC) override this."""
+        inv = self._inv.get(name)
+        if inv is None:
+            return V
+        return inv["iG"] @ V @ inv["iA"]
+
     def _refresh_inverses(self) -> list[tuple[float, float]]:
         g = self.param_groups[0]
         conds = []
@@ -121,15 +129,13 @@ class KFAC(Optimizer, DiagnosticsMixin):
             # ---- natural gradients for tracked modules
             nat: list[tuple[torch.Tensor, torch.Tensor]] = []  # (param, nat_grad)
             for name, m in self._name_to_module.items():
-                inv = self._inv.get(name)
                 w = m.weight
                 if w.grad is None:
                     continue
                 gW = w.grad.reshape(w.shape[0], -1)
                 has_bias = m.bias is not None and m.bias.grad is not None
                 V = torch.cat([gW, m.bias.grad.unsqueeze(1)], dim=1) if has_bias else gW
-                if inv is not None:
-                    V = inv["iG"] @ V @ inv["iA"]
+                V = self._precondition(name, V)
                 if has_bias:
                     nat.append((w, V[:, :-1].reshape(w.shape)))
                     nat.append((m.bias, V[:, -1]))
