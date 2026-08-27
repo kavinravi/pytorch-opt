@@ -115,3 +115,14 @@ def test_lm_update():
     assert lm_update(1e-3, rho=0.1) > 1e-3
     assert lm_update(1e-3, rho=0.5) == 1e-3
     assert lm_update(1e-12, rho=0.9) == 1e-8
+
+
+def test_no_grad_forward_is_ignored(device):
+    # a validation pass under torch.no_grad() (with the model still in train
+    # mode) must neither crash nor pollute the factors
+    lin = nn.Linear(3, 2).to(device)
+    tr = KronTracker(lin)
+    tr.enabled = True
+    with torch.no_grad():
+        lin(torch.randn(4, 3, device=device))
+    assert "" not in tr.factors

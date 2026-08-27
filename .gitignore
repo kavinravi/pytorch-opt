@@ -11,3 +11,4 @@ dist/
 .ninja_log
 .coverage
 htmlcov/
+data/
