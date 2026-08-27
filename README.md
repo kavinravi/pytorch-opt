@@ -69,23 +69,30 @@ Hessian eigenvalues.
 | `Shampoo` | Kronecker full-matrix preconditioner | ✅ proven |
 | `KFAC` | natural gradient (quasi-Fisher) | ✅ proven |
 | `TrustNCG` | trust-region Newton-CG | ✅ proven |
-| `NGD` (exact) | natural gradient | in progress |
-| `SOAP` | Shampoo eigenbasis + Adam | planned |
-| `AdaHessian` | Hutchinson diagonal Hessian | planned |
-| `Sophia` | clipped diagonal (Hutchinson / GNB) | planned |
-| `EKFAC` | K-FAC eigenbasis rescaling | planned |
-| `HessianFree` | Martens CG-Newton | planned |
-| `PSGD` (Kron) | whitening preconditioner | planned |
+| `NGD` (exact) | natural gradient (dense-Fisher oracle) | ✅ proven |
+| `SOAP` | Shampoo eigenbasis + Adam | ✅ proven |
+| `AdaHessian` | Hutchinson diagonal Hessian | ✅ proven |
+| `Sophia` | clipped diagonal (Hutchinson / GNB) | ✅ proven |
+| `EKFAC` | K-FAC eigenbasis rescaling | ✅ proven |
+| `HessianFree` | Martens CG-Newton | ✅ proven |
+| `PSGD` (Kron) | affine gradient-whitening preconditioner | ✅ proven |
 
 "Proven" = analytic ground-truth tests (e.g. Shampoo's first preconditioned
-step equals the gradient's polar factor U Vᵀ; TrustNCG solves a quadratic in
-one step; K-FAC's update equals the dense Kronecker solve and its sampled
-Fisher recovers the Newton direction), plus native/reference parity and
-determinism, round-trip, and diagnostics contracts. Test names in `tests/`.
+step equals the gradient's polar factor U Vᵀ; TrustNCG and HessianFree solve a
+quadratic in one step; K-FAC's update equals the dense Kronecker solve and its
+sampled Fisher recovers the Newton direction; SOAP is bitwise-Adam under
+identity rotations; EKFAC reduces exactly to K-FAC under eigenvalue scales;
+AdaHessian/Sophia recover exact diagonals on diagonal quadratics; PSGD
+provably whitens a known gradient covariance), plus native/reference parity
+and determinism, round-trip, and diagnostics contracts. Test names in
+`tests/`. Full suite: 227 tests, ~19 s on CPU + RTX 5090.
 
 ## Native backend notes
 
 Dev-box reality: RTX 5090 (sm_120) + torch cu130, system nvcc 12.0 — hand-CUDA
-kernels can't be compiled by that toolchain, and they aren't needed: the Tier-A
-C++/ATen extension runs on CUDA tensors through ATen's dispatcher. Tier-B fused
-kernels are gated on a matching CUDA 13 toolkit (e.g. pip `nvidia-cuda-nvcc-cu13`).
+kernels can't be compiled by that toolchain, and they aren't needed for
+correctness: the Tier-A C++/ATen extension runs on CUDA tensors through ATen's
+dispatcher (parity-proven on the 5090). Tier-B fused kernels are viable via the
+pip toolchain — `pip install nvidia-cuda-nvcc-cu13` ships nvcc 13.3 with
+sm_120 support at `site-packages/nvidia/cu13/bin/nvcc` (point `CUDA_HOME` there
+for `torch.utils.cpp_extension`); kernels themselves are future work.
