@@ -54,16 +54,20 @@ OPTIMIZERS = {
     # ---- literal AdamW drop-ins (params in, backward + step) ----
     "adamw":   lambda m: torch.optim.AdamW(m.parameters(), lr=1e-3),
     "muon":    lambda m: Muon(m.parameters(), lr=0.02, adamw_lr=1e-3),
-    "shampoo": lambda m: Shampoo(m.parameters(), lr=1e-3, graft="adagrad",
-                                 precondition_frequency=20),
+    "shampoo": lambda m: Shampoo(m.parameters(), lr=3e-3, graft="adagrad",
+                                 momentum=0.9, precondition_frequency=20),
     "soap":    lambda m: SOAP(m.parameters(), lr=3e-3, precondition_frequency=10),
-    "psgd":    lambda m: PSGD(m.parameters(), lr=1e-3, precond_lr=0.1),
+    "psgd":    lambda m: PSGD(m.parameters(), lr=1e-3, precond_lr=0.1,
+                              grad_clip_max_norm=100.0),
     # ---- same training loop, but constructed from the model (hooks) ----
-    "kfac":    lambda m: KFAC(m, lr=1e-3, damping=1e-2, inv_every=20),
-    "ekfac":   lambda m: EKFAC(m, lr=1e-3, damping=1e-2, inv_every=20),
+    "kfac":    lambda m: KFAC(m, lr=1e-3, damping=3e-2, inv_every=20,
+                              max_grad_norm=10.0),
+    "ekfac":   lambda m: EKFAC(m, lr=1e-3, damping=3e-2, inv_every=20,
+                               max_grad_norm=10.0),
     # ---- closure-based (curvature products / extra evals per step) ----
-    "adahessian":  lambda m: AdaHessian(m.parameters(), lr=0.05, update_freq=5),
-    "sophia":      lambda m: Sophia(m.parameters(), lr=3e-4, estimate_freq=10),
+    "adahessian":  lambda m: AdaHessian(m.parameters(), lr=3e-3, eps=1e-4,
+                                        update_freq=5),
+    "sophia":      lambda m: Sophia(m.parameters(), lr=1e-3, estimate_freq=10),
     "trustncg":    lambda m: TrustNCG(m.parameters(), delta0=1.0,
                                       curvature="ggn", max_cg_iter=30),
     "hessianfree": lambda m: HessianFree(m.parameters(), max_cg_iter=30),
@@ -118,6 +122,8 @@ def main():
     ap.add_argument("--data-dir", default="./data")
     ap.add_argument("--max-batches", type=int, default=None,
                     help="limit batches per epoch (smoke tests)")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="override the registry learning rate")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -132,6 +138,9 @@ def main():
 
     model = make_model().to(device)
     opt = OPTIMIZERS[args.optimizer](model)
+    if args.lr is not None:
+        for g in opt.param_groups:
+            g["lr"] = args.lr
     print(f"{args.optimizer} on {device} | params: "
           f"{sum(p.numel() for p in model.parameters()):,}")
 

@@ -114,7 +114,10 @@ class PSGD(Optimizer, DiagnosticsMixin):
         m, n = g2.shape
         scale = group["init_scale"]
         if scale is None:
-            scale = float((g2.pow(2).mean() + _TINY) ** (-1.0 / 4.0))
+            # P = (Ql^T Ql) (x) (Qr^T Qr) applies each side's scale squared, so
+            # for the whitening magnitude P ~ (E[g^2])^(-1/2) each side gets
+            # the 1/4-power of that: scale = (E[g^2])^(-1/8).
+            scale = float((g2.pow(2).mean() + _TINY) ** (-1.0 / 8.0))
         dense_l = m <= group["max_preconditioner_dim"]
         dense_r = n <= group["max_preconditioner_dim"]
         if not (dense_l and dense_r):     # simplify mixed pairs to diag/diag
