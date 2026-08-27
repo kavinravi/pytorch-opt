@@ -58,7 +58,9 @@ class KronTracker:
         # reuse the same forward repeatedly. A detached reference is cheap.
         # The gradient hook rides on the output tensor (fires on every backward
         # through this forward's graph; gated on self.enabled at fire time).
-        if not module.training:
+        # Skip eval-mode and no-grad forwards (e.g. validation passes):
+        # there is no backward coming, and grad hooks cannot attach.
+        if not (module.training and output.requires_grad):
             return
         self._inputs[self._module_names[module]] = inputs[0].detach()
         output.register_hook(lambda grad, m=module: self._on_grad_out(m, grad))
