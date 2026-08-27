@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytorch-opt"
+version = "0.1.0.dev0"
+description = "Second-order and structure-aware optimizers for PyTorch: natural gradient, quasi-Fisher, Kronecker-preconditioned, trust-region."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["pytorch_opt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
