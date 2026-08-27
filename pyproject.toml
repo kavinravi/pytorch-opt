@@ -17,5 +17,8 @@ test = ["pytest>=8"]
 [tool.setuptools.packages.find]
 include = ["pytorch_opt*"]
 
+[tool.setuptools.package-data]
+"pytorch_opt.ops" = ["csrc/*.cpp"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
