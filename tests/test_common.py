@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from pytorch_opt._testing import TinyMLP, make_regression, mse_half, run_steps
-from pytorch_opt.optim import KFAC, Muon, NGD, Shampoo, TrustNCG
+from pytorch_opt.optim import KFAC, Muon, NGD, Shampoo, SOAP, TrustNCG
 
 FACTORIES = {
     "muon": lambda m: Muon(m.parameters(), lr=0.02),
@@ -18,6 +18,7 @@ FACTORIES = {
     "kfac": lambda m: KFAC(m, lr=0.02, damping=1e-2, inv_every=2),
     "trustncg": lambda m: TrustNCG(m.parameters(), delta0=0.5),
     "ngd": lambda m: NGD(m.parameters(), lr=0.5, damping=1e-3, momentum=0.5),
+    "soap": lambda m: SOAP(m.parameters(), lr=1e-2, precondition_frequency=2),
 }
 
 REQUIRED_DIAG = {
@@ -29,6 +30,7 @@ REQUIRED_DIAG = {
     "trustncg": {"delta", "rho", "cg_iters", "cg_reason", "accepted",
                  "pred_reduction", "step_ms"},
     "ngd": {"fisher_cond", "nat_grad_norm", "step_ms", "curvature_ms"},
+    "soap": {"stale_steps", "n_adam_params", "step_ms", "curvature_ms"},
 }
 
 
