@@ -7,6 +7,7 @@ name = "pytorch-opt"
 version = "0.1.0.dev0"
 description = "Second-order and structure-aware optimizers for PyTorch: natural gradient, quasi-Fisher, Kronecker-preconditioned, trust-region."
 readme = "README.md"
+authors = [{name = "Kavin Ravi", email = "kavinravi121@gmail.com"}]
 requires-python = ">=3.10"
 dependencies = ["torch>=2.2"]
 

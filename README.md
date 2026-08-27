@@ -4,7 +4,7 @@ Second-order and structure-aware optimizers for PyTorch: natural gradient
 descent, quasi-Fisher methods, Kronecker-factored preconditioners, and
 trust-region Newton methods — all as `torch.optim.Optimizer` subclasses.
 
-Three layers (see `docs/2026-08-25-pytorch-opt-design.md`):
+Three layers (see [docs/design.md](docs/design.md)):
 
 - **`pytorch_opt.ops`** — shared numerics (inverse matrix roots, Newton–Schulz
   orthogonalization, Kronecker factor updates). Pure-torch reference
@@ -56,43 +56,37 @@ opt.step(closure)
 ```
 
 Every optimizer exposes `.diagnostics` (per-step dict: conditioning, damping,
-trust radius/ρ, staleness, timing splits), `state_dict()` round-trip, and a
-`state_layout()` tagging state replicable/shardable (distributed-readiness).
-`pytorch_opt.diag.hessian_eigs(closure, params, k)` gives Lanczos top-k
-Hessian eigenvalues.
+trust radius/ρ, staleness, timing splits), exact `state_dict()` round-trip,
+and a `state_layout()` tagging state replicable/shardable
+(distributed-readiness). `pytorch_opt.diag.hessian_eigs(closure, params, k)`
+gives Lanczos top-k Hessian eigenvalues.
 
-## Roster
+## Optimizers
 
-| optimizer | family | status |
+| optimizer | family | proven by |
 |---|---|---|
-| `Muon` | orthogonalized momentum | ✅ proven |
-| `Shampoo` | Kronecker full-matrix preconditioner | ✅ proven |
-| `KFAC` | natural gradient (quasi-Fisher) | ✅ proven |
-| `TrustNCG` | trust-region Newton-CG | ✅ proven |
-| `NGD` (exact) | natural gradient (dense-Fisher oracle) | ✅ proven |
-| `SOAP` | Shampoo eigenbasis + Adam | ✅ proven |
-| `AdaHessian` | Hutchinson diagonal Hessian | ✅ proven |
-| `Sophia` | clipped diagonal (Hutchinson / GNB) | ✅ proven |
-| `EKFAC` | K-FAC eigenbasis rescaling | ✅ proven |
-| `HessianFree` | Martens CG-Newton | ✅ proven |
-| `PSGD` (Kron) | affine gradient-whitening preconditioner | ✅ proven |
+| `Muon` | orthogonalized momentum | hand-computed step; Newton–Schulz band + polar direction |
+| `Shampoo` | Kronecker full-matrix preconditioner | first step ≡ polar factor `UVᵀ` of the gradient |
+| `SOAP` | Adam in Shampoo's eigenbasis | exactly Adam under identity rotations |
+| `KFAC` | Kronecker-factored natural gradient | ≡ dense Kronecker solve; sampled Fisher → Newton direction |
+| `EKFAC` | K-FAC eigenbasis rescaling | exact reduction to K-FAC; Frobenius optimality |
+| `NGD` | exact natural gradient (dense Fisher) | one-step optimum on linear-Gaussian models |
+| `TrustNCG` | trust-region Newton-CG | one-step quadratic optimum; saddle escape |
+| `HessianFree` | Martens CG-Newton | one-step quadratic optimum; LM damping adapts |
+| `AdaHessian` | Hutchinson diagonal Hessian | exact diagonal on diagonal quadratics |
+| `Sophia` | clipped diagonal (Hutchinson / GNB) | exact diagonal; hand-computed clipped step |
+| `PSGD` | Kronecker gradient-whitening | provably whitens a known gradient covariance |
 
-"Proven" = analytic ground-truth tests (e.g. Shampoo's first preconditioned
-step equals the gradient's polar factor U Vᵀ; TrustNCG and HessianFree solve a
-quadratic in one step; K-FAC's update equals the dense Kronecker solve and its
-sampled Fisher recovers the Newton direction; SOAP is bitwise-Adam under
-identity rotations; EKFAC reduces exactly to K-FAC under eigenvalue scales;
-AdaHessian/Sophia recover exact diagonals on diagonal quadratics; PSGD
-provably whitens a known gradient covariance), plus native/reference parity
-and determinism, round-trip, and diagnostics contracts. Test names in
-`tests/`. Full suite: 227 tests, ~19 s on CPU + RTX 5090.
+Every optimizer additionally passes convergence tests and the cross-optimizer
+contracts (bitwise determinism, `state_dict` round-trip, diagnostics schema,
+state-layout tags). Details and the full test map: [docs/verification.md](docs/verification.md).
 
 ## Native backend notes
 
-Dev-box reality: RTX 5090 (sm_120) + torch cu130, system nvcc 12.0 — hand-CUDA
-kernels can't be compiled by that toolchain, and they aren't needed for
-correctness: the Tier-A C++/ATen extension runs on CUDA tensors through ATen's
-dispatcher (parity-proven on the 5090). Tier-B fused kernels are viable via the
-pip toolchain — `pip install nvidia-cuda-nvcc-cu13` ships nvcc 13.3 with
-sm_120 support at `site-packages/nvidia/cu13/bin/nvcc` (point `CUDA_HOME` there
-for `torch.utils.cpp_extension`); kernels themselves are future work.
+The native tier is C++/ATen and needs only a host C++ compiler — the compiled
+extension runs on CUDA tensors through ATen's dispatcher, so a system CUDA
+toolkit that lags your GPU architecture (or torch's CUDA version) does not
+block it. Hand-written fused CUDA kernels are future work; on systems where
+the toolkit lags, `pip install nvidia-cuda-nvcc-cu13` provides a current nvcc
+(point `CUDA_HOME` at `site-packages/nvidia/cu13` for
+`torch.utils.cpp_extension`).
