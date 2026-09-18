@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from pytorch_opt._testing import mse_half
@@ -126,3 +125,23 @@ def test_no_grad_forward_is_ignored(device):
     with torch.no_grad():
         lin(torch.randn(4, 3, device=device))
     assert "" not in tr.factors
+
+
+def test_multiple_forwards_keep_their_own_activations():
+    lin = nn.Linear(3, 2, bias=False)
+    tr = KronTracker(lin, ema_decay=None)
+    x1, x2 = torch.randn(4, 3), torch.randn(4, 3) + 3
+    with tr.track():
+        out1, out2 = lin(x1), lin(x2)
+        (out1.sum() / 4).backward()
+        (out2.sum() / 4).backward()
+    expected = (x1.T @ x1 + x2.T @ x2) / 8
+    torch.testing.assert_close(tr.factors[""]["A"], expected)
+
+
+def test_autocast_backward_produces_float32_factors():
+    lin = nn.Linear(3, 2)
+    tr = KronTracker(lin)
+    with tr.track(), torch.autocast("cpu", dtype=torch.bfloat16):
+        lin(torch.randn(4, 3)).square().mean().backward()
+    assert all(v.dtype == torch.float32 for v in tr.factors[""].values())

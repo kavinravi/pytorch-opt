@@ -4,8 +4,8 @@ For each 2D+ parameter (reshaped (out, -1)) maintain Shampoo factors L, R and
 their eigenbases Q_L, Q_R (refreshed every `precondition_frequency` steps).
 The first moment lives in the original space (re-rotated on use); the second
 moment lives in the rotated space. With identity rotations SOAP is exactly
-Adam -- that identity is the analytic test. 1D/0D and oversize parameters get
-plain Adam.
+Adam -- that identity is the analytic test. 1D/0D and explicitly excluded
+parameters use the shared AdamW fallback. Oversized selected matrices raise.
 
 On basis refresh the rotated second moment is transported into the new basis
 through the squared basis-change matrices (the covariance-diagonal transform;
@@ -19,19 +19,24 @@ import torch
 from torch.optim import Optimizer
 
 from .. import ops
-from ._common import DiagnosticsMixin, StepTimer
+from ._common import DiagnosticsMixin, StepTimer, adamw_update, matrix_path, validate_groups, validate_checkpoint_groups
 
 
 class SOAP(Optimizer, DiagnosticsMixin):
     def __init__(self, params, lr: float = 3e-3, betas: tuple = (0.95, 0.95),
                  shampoo_beta: float = 0.95, eps: float = 1e-8,
                  precondition_frequency: int = 10,
-                 max_preconditioner_dim: int = 1024, weight_decay: float = 0.0):
+                 max_preconditioner_dim: int = 1024, weight_decay: float = 0.0,
+                 adamw_lr: float = 3e-4, adamw_betas: tuple = (0.9, 0.95),
+                 adamw_eps: float = 1e-8, adamw_wd: float = 0.0):
         defaults = dict(lr=lr, betas=betas, shampoo_beta=shampoo_beta, eps=eps,
                         precondition_frequency=precondition_frequency,
                         max_preconditioner_dim=max_preconditioner_dim,
-                        weight_decay=weight_decay)
+                        weight_decay=weight_decay, use_preconditioner=None,
+                        adamw_lr=adamw_lr, adamw_betas=adamw_betas,
+                        adamw_eps=adamw_eps, adamw_wd=adamw_wd)
         super().__init__(params, defaults)
+        validate_groups(self.param_groups)
 
     @classmethod
     def state_layout(cls) -> dict:
@@ -40,21 +45,20 @@ class SOAP(Optimizer, DiagnosticsMixin):
                 "exp_avg": "shardable", "exp_avg_sq": "shardable"}
 
     @staticmethod
-    def _adam_update(p, g, st, group, transform=None, back=None):
-        """torch.optim.Adam formula; moments optionally kept/used in a rotated
-        space via transform/back callables."""
+    def _soap_update(p, g, st, group, *, transform, back):
+        """Adam update in the current Shampoo eigenbasis."""
         b1, b2 = group["betas"]
         st["step"] += 1
         t = st["step"]
         st["exp_avg"].lerp_(g, 1 - b1)                     # original space
-        g_rot = transform(g) if transform is not None else g
+        g_rot = transform(g)
         st["exp_avg_sq"].mul_(b2).addcmul_(g_rot, g_rot, value=1 - b2)
-        m_rot = transform(st["exp_avg"]) if transform is not None else st["exp_avg"]
+        m_rot = transform(st["exp_avg"])
         bc1 = 1 - b1 ** t
         bc2 = 1 - b2 ** t
         denom = (st["exp_avg_sq"].sqrt() / bc2 ** 0.5).add_(group["eps"])
         upd_rot = m_rot / denom
-        upd = back(upd_rot) if back is not None else upd_rot
+        upd = back(upd_rot)
         if group["weight_decay"]:
             p.mul_(1.0 - group["lr"] * group["weight_decay"])
         p.add_(upd, alpha=-group["lr"] / bc1)
@@ -67,7 +71,7 @@ class SOAP(Optimizer, DiagnosticsMixin):
                 loss = closure()
         curvature_ms = 0.0
         stales = []
-        n_adam = 0
+        n_adamw = 0
         with StepTimer() as t_all:
             for group in self.param_groups:
                 for p in group["params"]:
@@ -75,19 +79,11 @@ class SOAP(Optimizer, DiagnosticsMixin):
                         continue
                     g = p.grad
                     st = self.state[p]
-                    matrix_path = p.ndim >= 2
-                    if matrix_path:
-                        g2 = g.reshape(g.shape[0], -1)
-                        if max(g2.shape) > group["max_preconditioner_dim"]:
-                            matrix_path = False
-                    if not matrix_path:
-                        n_adam += 1
-                        if "exp_avg" not in st:
-                            st["exp_avg"] = torch.zeros_like(p)
-                            st["exp_avg_sq"] = torch.zeros_like(p)
-                            st["step"] = 0
-                        self._adam_update(p, g, st, group)
+                    if not matrix_path(p, group):
+                        n_adamw += 1
+                        adamw_update(p, g, st, group)
                         continue
+                    g2 = g.reshape(g.shape[0], -1)
                     m, n = g2.shape
                     if "L" not in st:
                         st["L"] = torch.zeros(m, m, device=p.device, dtype=p.dtype)
@@ -119,11 +115,15 @@ class SOAP(Optimizer, DiagnosticsMixin):
                         st["stale"] += 1
                     stales.append(st["stale"])
                     Q_L, Q_R = st["Q_L"], st["Q_R"]
-                    self._adam_update(
+                    self._soap_update(
                         p.view(m, n), g2, st, group,
                         transform=lambda x: Q_L.T @ x @ Q_R,
                         back=lambda x: Q_L @ x @ Q_R.T)
         self._diag = {"stale_steps": max(stales) if stales else 0,
-                      "n_adam_params": n_adam, "step_ms": t_all.ms,
+                      "n_adamw_params": n_adamw, "step_ms": t_all.ms,
                       "curvature_ms": curvature_ms}
         return loss
+
+    def load_state_dict(self, state_dict):
+        validate_checkpoint_groups(self.param_groups, state_dict["param_groups"])
+        return super().load_state_dict(state_dict)

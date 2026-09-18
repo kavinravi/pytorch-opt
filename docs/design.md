@@ -70,9 +70,13 @@ Three deliberate asymmetries, stated rather than papered over:
    modes take `(loss, outputs)`.
 2. **`KFAC`/`EKFAC` take the model**, not a parameter iterable — they install
    module hooks and key curvature state by module path.
-3. **`Muon` routes parameters**: 2D+ weights get orthogonalized momentum
-   (conv kernels flattened), everything else an internal AdamW; override per
-   param group with `use_muon`.
+3. **Muon/Shampoo/SOAP/KFAC share AdamW routing**: use `matrix_param_groups`
+   to select named module weights and keep every remaining parameter in the
+   same AdamW group across comparisons. `use_preconditioner` controls routing;
+   Muon's older `use_muon` option remains an alias. KFAC accepts these groups
+   through `params=` while retaining the model argument for hooks. Explicit
+   groups use ordinary `lr`/`weight_decay` fields, including for the fallback.
+   Selected oversized matrices and missing KFAC curvature raise errors.
 
 ## Cross-cutting contracts
 

@@ -28,7 +28,7 @@ def test_1d_params_are_exactly_adam(device):
     torch.manual_seed(1)
     p_soap = nn.Parameter(torch.randn(9, device=device))
     p_adam = nn.Parameter(p_soap.detach().clone())
-    soap = SOAP([p_soap], lr=3e-3, betas=(0.95, 0.95))
+    soap = SOAP([p_soap], adamw_lr=3e-3, adamw_betas=(0.95, 0.95))
     adam = torch.optim.Adam([p_adam], lr=3e-3, betas=(0.95, 0.95), eps=1e-8)
     for _ in range(5):
         g = torch.randn(9, device=device)

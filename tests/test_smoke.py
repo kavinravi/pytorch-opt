@@ -1,5 +1,3 @@
-import torch
-
 import pytorch_opt
 from pytorch_opt._testing import TinyMLP, make_regression, mse_half
 

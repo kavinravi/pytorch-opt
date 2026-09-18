@@ -67,3 +67,19 @@ Parametrized over every optimizer in the roster:
   documented keys after a step.
 - **State layout** — every state key an optimizer creates is tagged
   `replicable` or `shardable` by `state_layout()`.
+
+## Shared fallback and model integration
+
+`tests/test_optimizer_routing.py` checks identical parameter assignments,
+AdamW parity against PyTorch across multiple steps and a scheduler, missing
+gradients, weight-decay exclusions, tied embeddings, and rejection of changed
+checkpoint routing. A tiny causal Transformer verifies BF16 autocast and exact
+CPU resume with and without non-reentrant activation checkpointing. Optional
+CUDA tests run one step through the installed Mamba-2 implementation with its
+module-visible projection path.
+
+KFAC/tracker regressions cover scaled sequence losses, sampled token logits,
+unchanged training gradients during sampled curvature, reused module calls,
+frozen biases, factor precision, and fused/functional projections that bypass
+hooks. These are correctness checks, not evidence of convergence or university
+GPU throughput at the study's model sizes.

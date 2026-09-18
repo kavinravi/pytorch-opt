@@ -44,7 +44,9 @@ class EKFAC(KFAC):
     def _precondition(self, name: str, V: torch.Tensor) -> torch.Tensor:
         inv = self._inv.get(name)
         if inv is None:
-            return V
+            raise RuntimeError(f"Missing EKFAC inverse for {name!r}")
+        original_dtype = V.dtype
+        V = V.to(inv["QG"].dtype)
         lam = self.param_groups[0]["damping"]
         Vt = inv["QG"].T @ V @ inv["QA"]
         s = self._scales.get(name)
@@ -53,11 +55,12 @@ class EKFAC(KFAC):
             self._scales[name] = s
         else:
             s.mul_(self._scale_decay).add_(Vt.pow(2), alpha=1 - self._scale_decay)
-        return inv["QG"] @ (Vt / (s + lam)) @ inv["QA"].T
+        return (inv["QG"] @ (Vt / (s + lam)) @ inv["QA"].T).to(original_dtype)
 
     def state_dict(self):
         sd = super().state_dict()
-        sd["ekfac"] = {"scales": {n: v for n, v in self._scales.items()}}
+        sd["ekfac"] = {"scales": {n: v for n, v in self._scales.items()},
+                       "scale_decay": self._scale_decay}
         return sd
 
     def load_state_dict(self, sd):
@@ -65,4 +68,6 @@ class EKFAC(KFAC):
         extra = sd.pop("ekfac", None)
         super().load_state_dict(sd)
         if extra is not None:
-            self._scales = {n: v.clone() for n, v in extra["scales"].items()}
+            self._scale_decay = extra.get("scale_decay", self._scale_decay)
+            restored = self._restore_curvature({n: {"scale": v} for n, v in extra["scales"].items()})
+            self._scales = {n: d["scale"] for n, d in restored.items()}

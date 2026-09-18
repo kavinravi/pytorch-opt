@@ -14,10 +14,6 @@ def _sym(A: torch.Tensor) -> torch.Tensor:
     return 0.5 * (A + A.mT)
 
 
-def _matrix_power_int(A: torch.Tensor, p: int) -> torch.Tensor:
-    return torch.linalg.matrix_power(A, p)
-
-
 def _coupled_newton(M: torch.Tensor, p: int, max_iter: int, tol: float) -> torch.Tensor:
     """Coupled Schur-Newton iteration for M^(-1/p), M symmetric PD (Anil et al. style)."""
     n = M.shape[-1]
@@ -33,7 +29,7 @@ def _coupled_newton(M: torch.Tensor, p: int, max_iter: int, tol: float) -> torch
     for _ in range(max_iter):
         Mi = (1.0 - alpha) * I + alpha * Mk
         X = X @ Mi
-        Mk = _matrix_power_int(Mi, p) @ Mk
+        Mk = torch.linalg.matrix_power(Mi, p) @ Mk
         err = (Mk - I).abs().amax()
         if prev_err is not None and err > prev_err * 1.2:
             X = prev_X  # diverging: keep last good iterate

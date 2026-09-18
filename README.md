@@ -61,6 +61,83 @@ and a `state_layout()` tagging state replicable/shardable
 (distributed-readiness). `pytorch_opt.diag.hessian_eigs(closure, params, k)`
 gives Lanczos top-k Hessian eigenvalues.
 
+## Consistent AdamW fallback for language models
+
+Muon, Shampoo, SOAP, and KFAC accept the same explicit parameter split.
+`matrix_param_groups` selects **named module weights**, and assigns every other
+trainable parameter to AdamW exactly once. It excludes biases, vectors and
+parameters marked `_no_weight_decay` from weight decay. Shared weights,
+including tied token embeddings/output heads, must stay in the AdamW group.
+
+```python
+from pytorch_opt import KFAC, Muon, Shampoo, SOAP, matrix_param_groups
+
+# These must be actual module paths in your model. For a bare Mamba2 mixer:
+selected_modules = ["in_proj", "out_proj"]
+groups = matrix_param_groups(
+    model, selected_modules,
+    lr=0.01, adamw_lr=3e-4, weight_decay=0.1, adamw_wd=0.1,
+)
+# Choose ONE optimizer, rebuilding groups for each independently initialized model:
+opt = KFAC(model, params=groups, fisher_mode="sampled")
+# opt = Muon(groups)
+# opt = Shampoo(groups, max_preconditioner_dim=4096)
+# opt = SOAP(groups, max_preconditioner_dim=4096)
+# Control arm: torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8)
+```
+
+Each group has `use_preconditioner`, `param_names`, `lr`, and `weight_decay`.
+Keep the same selected module paths across optimizer arms for a given model.
+The AdamW fallback defaults to `adamw_betas=(0.9, 0.95)` and `adamw_eps=1e-8`
+in all four optimizers. Explicit fallback groups use their ordinary `lr` and
+`weight_decay`, so standard PyTorch learning-rate schedulers handle both groups.
+Rebuild the groups for each optimizer; optimizers populate their group dictionaries.
+
+Without explicit groups, Muon/Shampoo/SOAP still select parameters by tensor
+rank, and use constructor `adamw_lr`/`adamw_wd` for the remaining parameters.
+That convenience mode cannot identify embeddings or output heads. Use the
+explicit split for experiments. Oversized selected Shampoo/SOAP matrices now
+raise an error instead of silently changing optimizer. Choose a sufficient
+`max_preconditioner_dim` and measure memory use before a full-size run.
+
+KFAC tracks only selected modules. It raises before updating parameters if a
+selected layer receives gradients without collecting curvature. For Mamba-2,
+construct the mixer with `use_mem_eff_path=False` to expose the `out_proj`
+module call; the fused path passes its weights directly to a kernel and bypasses
+hooks. Keep the same forward implementation across arms for controlled timing
+comparisons. Transformer projections must likewise execute their `nn.Linear`
+modules; functional projections, including some attention implementations, need
+an integration change. This package does not modify either model automatically.
+
+For KFAC, losses must be means over batch rows, or over tokens for sequence
+logits. With gradient accumulation or AMP scaling, tell empirical KFAC the
+scale applied to that mean loss **before backward**:
+
+```python
+opt.set_grad_scale(1.0 / accumulation_steps)
+# With GradScaler: opt.set_grad_scale(scaler.get_scale() / accumulation_steps)
+(loss / accumulation_steps).backward()
+# Unscale parameter gradients with scaler.unscale_(opt) before clipping/stepping.
+```
+
+This setting corrects curvature, not parameter gradients. Masked or weighted
+losses need a scale consistent with their actual reduction; the tracker cannot
+infer it. Linear statistics treat each token as a row. Conv2d retains the
+mean-over-batch KFC convention. Factors use at least FP32 even under autocast.
+For sampled Fisher, call `opt.update_curvature(logits)` before the training
+backward frees the graph. Logits may be `[batch, tokens, vocabulary]`; the
+auxiliary backward ignores the training loss scale and leaves `.grad` untouched.
+Use non-reentrant activation checkpointing with this extra backward.
+
+Optimizer state includes both update rules and KFAC curvature/cadence settings.
+Resume requires the same parameter split. Checkpoints predating this routing
+change are rejected; their SGD/diagonal fallback states cannot resume the new
+algorithm exactly. The old KFAC `sgd_lr` option is replaced by the AdamW options.
+Shampoo/SOAP now report `n_adamw_params` in diagnostics. Model/RNG/data-loader
+state and the generator passed to sampled Fisher remain the training loop's
+checkpoint responsibility. Distributed curvature synchronization is not
+implemented here.
+
 ## Optimizers
 
 | optimizer | family | proven by |
@@ -86,7 +163,4 @@ state-layout tags). Details and the full test map: [docs/verification.md](docs/v
 The native tier is C++/ATen and needs only a host C++ compiler — the compiled
 extension runs on CUDA tensors through ATen's dispatcher, so a system CUDA
 toolkit that lags your GPU architecture (or torch's CUDA version) does not
-block it. Hand-written fused CUDA kernels are future work; on systems where
-the toolkit lags, `pip install nvidia-cuda-nvcc-cu13` provides a current nvcc
-(point `CUDA_HOME` at `site-packages/nvidia/cu13` for
-`torch.utils.cpp_extension`).
+block it.

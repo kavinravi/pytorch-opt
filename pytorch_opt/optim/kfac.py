@@ -2,8 +2,9 @@
 
 API asymmetry (by design, see spec): KFAC takes the ``model``, not a parameter
 iterable -- it must install hooks on tracked modules (Linear, Conv2d) and key
-its curvature state by module path. Parameters of untracked modules get plain
-SGD-with-momentum at ``sgd_lr`` (default: ``lr``).
+its curvature state by module path. Unselected parameters use AdamW. Pass
+``params=matrix_param_groups(...)`` to share an explicit split with the other
+optimizers. Without groups, supported untied module weights/biases use K-FAC.
 
 Curvature modes: ``fisher_mode="empirical"`` accumulates factors from the real
 training backward on a ``stats_every`` cadence; ``"sampled"`` accumulates only
@@ -21,7 +22,7 @@ from torch.optim import Optimizer
 
 from ..curvature.damping import kfac_factored_damping
 from ..curvature.kron import KronTracker
-from ._common import DiagnosticsMixin, StepTimer
+from ._common import DiagnosticsMixin, StepTimer, adamw_update, validate_groups, validate_checkpoint_groups
 
 _FISHER_MODES = ("empirical", "sampled")
 
@@ -31,43 +32,92 @@ class KFAC(Optimizer, DiagnosticsMixin):
                  ema_decay: float | None = 0.95, momentum: float = 0.9,
                  stats_every: int = 1, inv_every: int = 10,
                  fisher_mode: str = "empirical", weight_decay: float = 0.0,
-                 max_grad_norm: float | None = None, sgd_lr: float | None = None):
+                 max_grad_norm: float | None = None, *, params=None,
+                 adamw_lr: float = 3e-4, adamw_betas: tuple = (0.9, 0.95),
+                 adamw_eps: float = 1e-8, adamw_wd: float = 0.0):
         if fisher_mode not in _FISHER_MODES:
             raise ValueError(f"fisher_mode must be one of {_FISHER_MODES}, got {fisher_mode!r}")
+        if stats_every < 1 or inv_every < 1:
+            raise ValueError("stats_every and inv_every must be positive")
         self.model = model
         self.fisher_mode = fisher_mode
-        self.tracker = KronTracker(model, ema_decay=ema_decay)
-        self._name_to_module = {name: m for m, name in self.tracker.tracked.items()}
-        kfac_params, kfac_ids = [], set()
-        for m in self.tracker.tracked:
-            for p in m.parameters(recurse=False):
-                if p.requires_grad:
-                    kfac_params.append(p)
-                    kfac_ids.add(id(p))
-        other = [p for p in model.parameters() if p.requires_grad and id(p) not in kfac_ids]
-        groups = [{"params": kfac_params, "kfac": True}]
-        if other:
-            groups.append({"params": other, "kfac": False})
+        owners = {}
+        for module in model.modules():
+            for p in module.parameters(recurse=False):
+                owners[id(p)] = owners.get(id(p), 0) + 1
+        supported = {name: m for name, m in model.named_modules()
+                     if isinstance(m, (nn.Linear, nn.Conv2d))
+                     and (not isinstance(m, nn.Conv2d) or m.groups == 1)
+                     and m.weight.requires_grad and owners[id(m.weight)] == 1}
+        if params is None:
+            primary = [p for m in supported.values()
+                       for p in m.parameters(recurse=False)
+                       if p.requires_grad and owners[id(p)] == 1]
+            selected_ids = {id(p) for p in primary}
+            params = [{"params": primary, "use_preconditioner": True}]
+            # Preserve standard exclusions for the automatic fallback as well.
+            for decay in (False, True):
+                other = [p for p in model.parameters() if p.requires_grad
+                         and id(p) not in selected_ids
+                         and (p.ndim >= 2 and not getattr(p, "_no_weight_decay", False)) == decay]
+                if other:
+                    params.append(dict(params=other, use_preconditioner=False,
+                                       lr=adamw_lr, weight_decay=adamw_wd if decay else 0.0))
+        else:
+            params = list(params)
+            if any(not isinstance(g, dict) or not isinstance(g.get("use_preconditioner"), bool)
+                   for g in params):
+                raise ValueError("KFAC params must be groups with explicit use_preconditioner")
+        # Keep curvature settings in the first primary group. Per-group learning
+        # rates, momentum and weight decay are applied below to each parameter.
+        params = sorted(params, key=lambda g: not g["use_preconditioner"])
         defaults = dict(lr=lr, damping=damping, momentum=momentum,
                         stats_every=stats_every, inv_every=inv_every,
                         weight_decay=weight_decay, max_grad_norm=max_grad_norm,
-                        sgd_lr=sgd_lr if sgd_lr is not None else lr)
-        super().__init__(groups, defaults)
+                        adamw_lr=adamw_lr, adamw_betas=adamw_betas,
+                        adamw_eps=adamw_eps, adamw_wd=adamw_wd)
+        super().__init__(params, defaults)
+        validate_groups(self.param_groups, matrices=False)
+        trainable = {id(p) for p in model.parameters() if p.requires_grad}
+        assigned = {id(p) for g in self.param_groups for p in g["params"]}
+        if assigned != trainable:
+            raise ValueError("KFAC groups must cover every trainable model parameter exactly once")
+        selected_ids = {id(p) for g in self.param_groups if g["use_preconditioner"] for p in g["params"]}
+        self._name_to_module = {n: m for n, m in supported.items() if id(m.weight) in selected_ids}
+        bias_modules = {n for n, m in self._name_to_module.items()
+                        if m.bias is not None and id(m.bias) in selected_ids
+                        and owners[id(m.bias)] == 1}
+        covered = {id(m.weight) for m in self._name_to_module.values()}
+        covered.update(id(self._name_to_module[n].bias) for n in bias_modules)
+        if covered != selected_ids:
+            raise ValueError("KFAC selection must contain supported, untied module weights and optional biases")
+        self.tracker = KronTracker(model, ema_decay=ema_decay,
+                                   module_names=self._name_to_module, bias_modules=bias_modules)
         self._steps = 0
         self._inv: dict[str, dict] = {}
+        self._last_counts = {}
         self._inv_stale = 0
         self._sync_tracking()
 
     def _sync_tracking(self) -> None:
-        g = self.param_groups[0]
-        self.tracker.enabled = (self.fisher_mode == "empirical"
-                                and self._steps % g["stats_every"] == 0)
+        collect = self._steps % self.param_groups[0]["stats_every"] == 0
+        self.tracker.capture = collect
+        self.tracker.enabled = self.fisher_mode == "empirical" and collect
+
+    def set_grad_scale(self, scale: float) -> None:
+        """Set before backward: 1 / accumulation_steps, or AMP scale / steps.
+
+        This corrects curvature only. Unscale ordinary parameter gradients before
+        calling step, as with any optimizer. Sampled Fisher ignores this scale.
+        """
+        self.tracker.set_grad_scale(scale)
 
     @classmethod
     def state_layout(cls) -> dict:
         return {"A": "replicable", "G": "replicable", "iA": "replicable",
                 "iG": "replicable", "steps": "replicable", "inv_stale": "replicable",
-                "momentum_buffer": "shardable"}
+                "momentum_buffer": "shardable", "step": "shardable",
+                "exp_avg": "shardable", "exp_avg_sq": "shardable"}
 
     # ------------------------------------------------------------- curvature
 
@@ -92,8 +142,9 @@ class KFAC(Optimizer, DiagnosticsMixin):
         Subclasses (EKFAC) override this."""
         inv = self._inv.get(name)
         if inv is None:
-            return V
-        return inv["iG"] @ V @ inv["iA"]
+            raise RuntimeError(f"Missing K-FAC inverse for {name!r}")
+        with torch.autocast(device_type=V.device.type, enabled=False):
+            return (inv["iG"] @ V.to(inv["iG"].dtype) @ inv["iA"]).to(V.dtype)
 
     def _refresh_inverses(self) -> list[tuple[float, float]]:
         g = self.param_groups[0]
@@ -115,6 +166,23 @@ class KFAC(Optimizer, DiagnosticsMixin):
             with torch.enable_grad():
                 loss = closure()
         g0 = self.param_groups[0]
+        # Validate every selected layer before changing any parameters. A fused
+        # or functional call can produce weight gradients without firing hooks.
+        for name, module in self._name_to_module.items():
+            if module.weight.grad is None and not (
+                self.tracker.includes_bias(module) and module.bias.grad is not None
+            ):
+                continue
+            fresh = self.tracker._counts.get(name, 0) > self._last_counts.get(name, 0)
+            if name not in self.tracker.factors or (
+                self._steps % g0["stats_every"] == 0 and not fresh
+            ):
+                raise RuntimeError(
+                    f"No K-FAC curvature collected for {name!r}. Check update_curvature "
+                    "and module hooks; fused/functional projections bypass hooks. "
+                    "For Mamba-2, use_mem_eff_path=False exposes out_proj."
+                )
+        groups = {id(p): group for group in self.param_groups for p in group["params"]}
         curvature_ms = 0.0
         conds = []
         with StepTimer() as t_all:
@@ -130,17 +198,20 @@ class KFAC(Optimizer, DiagnosticsMixin):
             nat: list[tuple[torch.Tensor, torch.Tensor]] = []  # (param, nat_grad)
             for name, m in self._name_to_module.items():
                 w = m.weight
-                if w.grad is None:
+                has_bias = self.tracker.includes_bias(m)
+                if w.grad is None and not (has_bias and m.bias.grad is not None):
                     continue
-                gW = w.grad.reshape(w.shape[0], -1)
-                has_bias = m.bias is not None and m.bias.grad is not None
-                V = torch.cat([gW, m.bias.grad.unsqueeze(1)], dim=1) if has_bias else gW
-                V = self._precondition(name, V)
+                gW = (w.grad if w.grad is not None else torch.zeros_like(w)).reshape(w.shape[0], -1)
                 if has_bias:
-                    nat.append((w, V[:, :-1].reshape(w.shape)))
-                    nat.append((m.bias, V[:, -1]))
+                    gb = m.bias.grad if m.bias.grad is not None else torch.zeros_like(m.bias)
+                    V = torch.cat([gW, gb.unsqueeze(1)], dim=1)
                 else:
-                    nat.append((w, V.reshape(w.shape)))
+                    V = gW
+                V = self._precondition(name, V)
+                if w.grad is not None:
+                    nat.append((w, (V[:, :-1] if has_bias else V).reshape(w.shape)))
+                if has_bias and m.bias.grad is not None:
+                    nat.append((m.bias, V[:, -1]))
 
             nat_norm = torch.sqrt(sum(d.pow(2).sum() for _, d in nat)) if nat else torch.tensor(0.0)
             scale = 1.0
@@ -148,38 +219,32 @@ class KFAC(Optimizer, DiagnosticsMixin):
                 scale = g0["max_grad_norm"] / (float(nat_norm) + 1e-12)
 
             for p, d in nat:
+                group = groups[id(p)]
                 st = self.state[p]
-                if g0["momentum"]:
+                if group["momentum"]:
                     if "momentum_buffer" not in st:
                         st["momentum_buffer"] = torch.zeros_like(p)
-                    st["momentum_buffer"].mul_(g0["momentum"]).add_(d, alpha=scale)
+                    st["momentum_buffer"].mul_(group["momentum"]).add_(d, alpha=scale)
                     upd = st["momentum_buffer"]
                 else:
                     upd = d * scale
-                if g0["weight_decay"]:
-                    p.mul_(1.0 - g0["lr"] * g0["weight_decay"])
-                p.add_(upd, alpha=-g0["lr"])
+                if group["weight_decay"]:
+                    p.mul_(1.0 - group["lr"] * group["weight_decay"])
+                p.add_(upd, alpha=-group["lr"])
 
-            # ---- untracked params: SGD with momentum
-            for group in self.param_groups[1:]:
+            n_adamw = 0
+            for group in self.param_groups:
+                if group["use_preconditioner"]:
+                    continue
                 for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    st = self.state[p]
-                    if group["momentum"]:
-                        if "momentum_buffer" not in st:
-                            st["momentum_buffer"] = torch.zeros_like(p)
-                        st["momentum_buffer"].mul_(group["momentum"]).add_(p.grad)
-                        upd = st["momentum_buffer"]
-                    else:
-                        upd = p.grad
-                    if group["weight_decay"]:
-                        p.mul_(1.0 - group["sgd_lr"] * group["weight_decay"])
-                    p.add_(upd, alpha=-group["sgd_lr"])
-
+                    if p.grad is not None:
+                        adamw_update(p, p.grad, self.state[p], group)
+                        n_adamw += 1
+            self._last_counts = dict(self.tracker._counts)
             self._steps += 1
             self._sync_tracking()
         self._diag = {
+            "n_adamw_params": n_adamw,
             "damping": g0["damping"],
             "mean_cond_A": sum(c[0] for c in conds) / len(conds) if conds else None,
             "mean_cond_G": sum(c[1] for c in conds) / len(conds) if conds else None,
@@ -200,20 +265,42 @@ class KFAC(Optimizer, DiagnosticsMixin):
             "factors": {n: {k: v for k, v in f.items()} for n, f in self.tracker.factors.items()},
             "inv": {n: {k: v for k, v in d.items()} for n, d in self._inv.items()},
             "counts": dict(self.tracker._counts),
+            "last_counts": dict(self._last_counts),
+            "modules": list(self._name_to_module),
+            "bias_modules": sorted(self.tracker.bias_modules),
+            "fisher_mode": self.fisher_mode,
+            "ema_decay": self.tracker.ema_decay,
+            "grad_scale": self.tracker.grad_scale,
         }
         return sd
 
     def load_state_dict(self, sd):
         sd = dict(sd)
         extra = sd.pop("kfac", None)
+        if extra is None:
+            raise ValueError("Checkpoint is missing K-FAC curvature state")
+        if "modules" in extra:
+            if (extra["modules"] != list(self._name_to_module)
+                    or extra["bias_modules"] != sorted(self.tracker.bias_modules)):
+                raise ValueError("Checkpoint K-FAC module selection differs from this optimizer")
+        validate_checkpoint_groups(self.param_groups, sd["param_groups"])
         super().load_state_dict(sd)
-        if extra is not None:
-            self._steps = int(extra["steps"])
-            self._inv_stale = int(extra["inv_stale"])
-            self.tracker.factors = {
-                n: {k: v.clone() for k, v in f.items()} for n, f in extra["factors"].items()
-            }
-            self._inv = {n: {k: (v.clone() if torch.is_tensor(v) else v) for k, v in d.items()}
-                         for n, d in extra["inv"].items()}
-            self.tracker._counts = dict(extra["counts"])
-            self._sync_tracking()
+        self._steps = int(extra["steps"])
+        self._inv_stale = int(extra["inv_stale"])
+        self.fisher_mode = extra.get("fisher_mode", self.fisher_mode)
+        self.tracker.ema_decay = extra.get("ema_decay", self.tracker.ema_decay)
+        self.tracker.set_grad_scale(extra.get("grad_scale", 1.0))
+        self.tracker.factors = self._restore_curvature(extra["factors"])
+        self._inv = self._restore_curvature(extra["inv"])
+        self.tracker._counts = dict(extra["counts"])
+        self._last_counts = dict(extra.get("last_counts", extra["counts"]))
+        self._sync_tracking()
+
+    def _restore_curvature(self, values):
+        restored = {}
+        for name, tensors in values.items():
+            weight = self._name_to_module[name].weight
+            dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
+            restored[name] = {k: v.to(device=weight.device, dtype=dtype).clone()
+                              if torch.is_tensor(v) else v for k, v in tensors.items()}
+        return restored

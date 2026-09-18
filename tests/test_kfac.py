@@ -110,3 +110,103 @@ def test_conv_path_trains(device):
     A1 = opt.tracker.factors["conv1"]["A"]
     G1 = opt.tracker.factors["conv1"]["G"]
     assert A1.shape == (10, 10) and G1.shape == (4, 4)   # 1*3*3 + bias, out=4
+
+
+def test_scaled_token_loss_preserves_curvature():
+    import copy
+    model = nn.Linear(4, 3)
+    scaled = copy.deepcopy(model)
+    opt = KFAC(model, inv_every=1)
+    opt_scaled = KFAC(scaled, inv_every=1)
+    x, targets = torch.randn(2, 5, 4), torch.randint(3, (2, 5))
+    F.cross_entropy(model(x).flatten(0, 1), targets.flatten()).backward()
+    # Simulate both an accumulation divisor and an AMP loss scale.
+    scale = 128 / 32
+    opt_scaled.set_grad_scale(scale)
+    (F.cross_entropy(scaled(x).flatten(0, 1), targets.flatten()) * scale).backward()
+    for key in ("A", "G"):
+        torch.testing.assert_close(opt.tracker.factors[""][key], opt_scaled.tracker.factors[""][key])
+    for p in scaled.parameters():
+        p.grad.div_(scale)
+    opt.step()
+    opt_scaled.step()
+    for p, q in zip(model.parameters(), scaled.parameters()):
+        torch.testing.assert_close(p, q)
+
+
+def test_sampled_token_logits_ignore_training_gradient_scale_and_preserve_grads():
+    import copy
+    model = nn.Linear(4, 3)
+    other = copy.deepcopy(model)
+    opt = KFAC(model, fisher_mode="sampled")
+    opt2 = KFAC(other, fisher_mode="sampled")
+    opt2.set_grad_scale(1 / 32)
+    x = torch.randn(2, 5, 4)
+    saved = {}
+    for p in other.parameters():
+        p.grad = torch.randn_like(p)
+        saved[p] = p.grad.clone()
+    opt.update_curvature(model(x), generator=torch.Generator().manual_seed(7))
+    opt2.update_curvature(other(x), generator=torch.Generator().manual_seed(7))
+    for key in ("A", "G"):
+        torch.testing.assert_close(opt.tracker.factors[""][key], opt2.tracker.factors[""][key])
+    for p, value in saved.items():
+        assert torch.equal(p.grad, value)
+    assert opt2.tracker.grad_scale == 1 / 32
+
+
+def test_functional_projection_cannot_silently_skip_kfac():
+    import pytest
+    from pytorch_opt import matrix_param_groups
+
+    class Projection(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj = nn.Linear(4, 8)
+            self.out_proj = nn.Linear(8, 4)
+            self.fused = False
+
+        def forward(self, x):
+            x = self.in_proj(x).relu()
+            return F.linear(x, self.out_proj.weight, self.out_proj.bias) if self.fused else self.out_proj(x)
+
+    model = Projection()
+    opt = KFAC(model, params=matrix_param_groups(model, ["in_proj", "out_proj"], lr=0.01))
+    x = torch.randn(2, 5, 4)
+    model(x).square().mean().backward()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    model.fused = True
+    model(x).square().mean().backward()
+    before = [p.detach().clone() for p in model.parameters()]
+    with pytest.raises(RuntimeError, match="No K-FAC curvature collected for 'out_proj'"):
+        opt.step()
+    assert all(torch.equal(p, old) for p, old in zip(model.parameters(), before))
+
+
+def test_frozen_bias_does_not_add_curvature_column():
+    model = nn.Linear(4, 3)
+    model.bias.requires_grad_(False)
+    opt = KFAC(model)
+    model(torch.randn(2, 4)).square().mean().backward()
+    opt.step()
+    assert opt.tracker.factors[""]["A"].shape == (4, 4)
+
+
+def test_checkpoint_restores_curvature_configuration_and_dtype():
+    import copy
+    model = nn.Linear(4, 3)
+    opt = KFAC(model, fisher_mode="sampled", ema_decay=0.7)
+    opt.set_grad_scale(1 / 32)
+    out = model(torch.randn(2, 5, 4))
+    opt.update_curvature(out)
+    out.square().mean().backward()
+    opt.step()
+    restored = nn.Linear(4, 3).double()
+    resumed = KFAC(restored)
+    resumed.load_state_dict(copy.deepcopy(opt.state_dict()))
+    assert resumed.fisher_mode == "sampled"
+    assert resumed.tracker.ema_decay == 0.7
+    assert resumed.tracker.grad_scale == 1 / 32
+    assert all(v.dtype == torch.float64 for f in resumed.tracker.factors.values() for v in f.values())
+    assert resumed._inv[""]["iA"].dtype == torch.float64

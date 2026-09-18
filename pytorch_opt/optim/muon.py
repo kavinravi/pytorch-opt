@@ -2,7 +2,7 @@
 
 Routing (per the design spec): orthogonalized momentum applies to parameters
 with ndim >= 2 (conv kernels flattened to (out, -1)); everything else falls
-back to an internal AdamW. Override per param group with ``use_muon``.
+back to an internal AdamW. Override per param group with ``use_preconditioner`` (or legacy ``use_muon``).
 Embeddings and output heads belong in an AdamW group (``use_muon=False``) --
 routing by ndim cannot detect them.
 """
@@ -13,7 +13,7 @@ import torch
 from torch.optim import Optimizer
 
 from .. import ops
-from ._common import DiagnosticsMixin, StepTimer
+from ._common import DiagnosticsMixin, StepTimer, adamw_update, matrix_path, validate_groups, validate_checkpoint_groups
 
 _LR_ADJUST = ("spectral", "match_rms_adam", "none")
 
@@ -29,8 +29,19 @@ class Muon(Optimizer, DiagnosticsMixin):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                         weight_decay=weight_decay, lr_adjust=lr_adjust, adamw_lr=adamw_lr,
                         adamw_betas=adamw_betas, adamw_eps=adamw_eps, adamw_wd=adamw_wd,
-                        use_muon=None)
+                        use_muon=None, use_preconditioner=None)
         super().__init__(params, defaults)
+        for group in self.param_groups:
+            if group["use_muon"] is not None:
+                if (group["use_preconditioner"] is not None
+                        and group["use_preconditioner"] != group["use_muon"]):
+                    raise ValueError("use_muon conflicts with use_preconditioner")
+                # Keep legacy use_muon=False using its adamw_* options.
+                if group["use_preconditioner"] is None and not group["use_muon"]:
+                    group["lr"] = group["adamw_lr"]
+                    group["weight_decay"] = group["adamw_wd"]
+                group["use_preconditioner"] = group["use_muon"]
+        validate_groups(self.param_groups)
 
     @classmethod
     def state_layout(cls) -> dict:
@@ -61,7 +72,7 @@ class Muon(Optimizer, DiagnosticsMixin):
                     if p.grad is None:
                         continue
                     g = p.grad
-                    routed = group["use_muon"] if group["use_muon"] is not None else p.ndim >= 2
+                    routed = matrix_path(p, group)
                     st = self.state[p]
                     if routed:
                         n_muon += 1
@@ -82,25 +93,14 @@ class Muon(Optimizer, DiagnosticsMixin):
                         n_el += upd.numel()
                     else:
                         n_adamw += 1
-                        if "exp_avg" not in st:
-                            st["exp_avg"] = torch.zeros_like(p)
-                            st["exp_avg_sq"] = torch.zeros_like(p)
-                            st["step"] = 0
-                        st["step"] += 1
-                        b1, b2 = group["adamw_betas"]
-                        st["exp_avg"].mul_(b1).add_(g, alpha=1 - b1)
-                        st["exp_avg_sq"].mul_(b2).addcmul_(g, g, value=1 - b2)
-                        bc1 = 1 - b1 ** st["step"]
-                        bc2 = 1 - b2 ** st["step"]
-                        if group["adamw_wd"]:
-                            p.mul_(1.0 - group["adamw_lr"] * group["adamw_wd"])
-                        denom = (st["exp_avg_sq"] / bc2).sqrt().add_(group["adamw_eps"])
-                        upd = (st["exp_avg"] / bc1) / denom
-                        eff = group["adamw_lr"]
-                        p.add_(upd, alpha=-eff)
+                        upd, eff = adamw_update(p, g, st, group)
                         sq_sum += float(upd.pow(2).sum()) * eff * eff
                         n_el += upd.numel()
         self._diag = {"update_rms": (sq_sum / max(n_el, 1)) ** 0.5,
                       "n_muon_params": n_muon, "n_adamw_params": n_adamw,
                       "step_ms": t.ms}
         return loss
+
+    def load_state_dict(self, state_dict):
+        validate_checkpoint_groups(self.param_groups, state_dict["param_groups"])
+        return super().load_state_dict(state_dict)

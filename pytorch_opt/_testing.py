@@ -30,14 +30,8 @@ class TinyCNN(nn.Module):
         return self.head(x.flatten(1))
 
 
-def _gen(seed: int) -> torch.Generator:
-    g = torch.Generator()
-    g.manual_seed(seed)
-    return g
-
-
 def make_regression(n: int = 64, d: int = 8, *, seed: int = 0, device="cpu"):
-    g = _gen(seed)
+    g = torch.Generator().manual_seed(seed)
     X = torch.randn(n, d, generator=g)
     w = torch.randn(d, 1, generator=g) / d**0.5
     y = X @ w + 0.05 * torch.randn(n, 1, generator=g)
@@ -45,7 +39,7 @@ def make_regression(n: int = 64, d: int = 8, *, seed: int = 0, device="cpu"):
 
 
 def make_classification(n: int = 64, d: int = 8, k: int = 3, *, seed: int = 0, device="cpu"):
-    g = _gen(seed)
+    g = torch.Generator().manual_seed(seed)
     X = torch.randn(n, d, generator=g)
     W = torch.randn(d, k, generator=g)
     y = (X @ W + 0.5 * torch.randn(n, k, generator=g)).argmax(dim=1)

@@ -35,19 +35,24 @@ def test_stale_roots_between_refreshes(device):
     assert opt.diagnostics["stale_steps"] >= 0
 
 
-def test_1d_and_oversize_fall_back_to_diagonal(device):
+def test_1d_and_explicit_matrix_fallback_match_adamw(device):
     torch.manual_seed(2)
     b = nn.Parameter(torch.randn(7, device=device))
     w = nn.Parameter(torch.randn(6, 5, device=device))
-    opt = Shampoo([b, w], max_preconditioner_dim=4, lr=0.1, beta2=1.0, diag_eps=1e-10)
-    gb, gw = torch.randn_like(b), torch.randn_like(w)
-    b0, w0 = b.detach().clone(), w.detach().clone()
-    b.grad, w.grad = gb.clone(), gw.clone()
-    opt.step()
-    assert opt.diagnostics["n_diag_params"] == 2
+    refs = [nn.Parameter(p.detach().clone()) for p in (b, w)]
+    opt = Shampoo([dict(params=[b, w], use_preconditioner=False, lr=0.1,
+                        weight_decay=0.2)], max_preconditioner_dim=4)
+    adamw = torch.optim.AdamW(refs, lr=0.1, betas=(0.9, 0.95), weight_decay=0.2)
+    for _ in range(3):
+        for p, ref in zip((b, w), refs):
+            p.grad = torch.randn_like(p)
+            ref.grad = p.grad.clone()
+        opt.step()
+        adamw.step()
+    assert opt.diagnostics["n_adamw_params"] == 2
     assert "L" not in opt.state[w]
-    want_b = b0 - 0.1 * gb / (gb.abs() + 1e-10)      # first-step adagrad
-    assert torch.allclose(b.detach(), want_b, atol=1e-6)
+    for p, ref in zip((b, w), refs):
+        torch.testing.assert_close(p, ref)
 
 
 def test_grafting_sgd_norm(device):

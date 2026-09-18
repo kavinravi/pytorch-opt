@@ -118,11 +118,7 @@ class PSGD(Optimizer, DiagnosticsMixin):
             # for the whitening magnitude P ~ (E[g^2])^(-1/2) each side gets
             # the 1/4-power of that: scale = (E[g^2])^(-1/8).
             scale = float((g2.pow(2).mean() + _TINY) ** (-1.0 / 8.0))
-        dense_l = m <= group["max_preconditioner_dim"]
-        dense_r = n <= group["max_preconditioner_dim"]
-        if not (dense_l and dense_r):     # simplify mixed pairs to diag/diag
-            dense_l = dense_r = False
-        if dense_l:
+        if max(m, n) <= group["max_preconditioner_dim"]:
             st["Ql"] = scale * torch.eye(m, device=g2.device, dtype=g2.dtype)
             st["Qr"] = scale * torch.eye(n, device=g2.device, dtype=g2.dtype)
         else:
